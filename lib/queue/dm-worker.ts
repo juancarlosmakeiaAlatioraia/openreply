@@ -44,6 +44,7 @@ import {
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
 import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
+import { generateAiReply, isAiReplyEnabled } from "@/lib/ai/reply";
 
 import {
   ZernioApiError,
@@ -1134,6 +1135,10 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
 
   const dedupeId = `dm:${messageId}`;
 
+  // Parche propio (no upstream): si ninguna campana casa, contesta la IA al
+  // final de esta funcion. Ver lib/ai/reply.ts.
+  let handledByCampaign = false;
+
   for (const automation of automations) {
     const matchResult = automation.matchAnyWord
       ? { matched: true, matchedKeyword: null }
@@ -1144,6 +1149,10 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
         );
 
     if (!matchResult.matched) continue;
+
+    // Se marca al casar, no al enviar: si una campana casa pero falla el envio,
+    // la IA no debe colarse encima con una segunda respuesta.
+    handledByCampaign = true;
 
     const existingLog = await prisma.dmLog.findUnique({
       where: {
@@ -1365,6 +1374,77 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       });
       throw error;
     }
+  }
+
+  await replyWithAi({ job, handledByCampaign });
+}
+
+/**
+ * Parche propio (no upstream): contesta con Claude un DM que no ha disparado
+ * ninguna campana.
+ *
+ * Sin ANTHROPIC_API_KEY esto es un no-op y OpenReply se comporta exactamente
+ * igual que antes del parche. Vive en su propia funcion, y no dentro de
+ * processMessage, para que los merges con diwenne/openreply toquen una linea.
+ */
+async function replyWithAi({
+  job,
+  handledByCampaign,
+}: {
+  job: Job<ProcessMessageJob>;
+  handledByCampaign: boolean;
+}): Promise<void> {
+  const { instagramAccountId, messageId, messageText, senderId } = job.data;
+  if (handledByCampaign || !isAiReplyEnabled() || !messageText?.trim()) return;
+
+  const account = await prisma.instagramAccount.findUnique({
+    where: job.data.accountConnectionId
+      ? { id: job.data.accountConnectionId }
+      : { instagramId: instagramAccountId },
+  });
+  if (!account || !hasInstagramCredentials(account)) return;
+
+  try {
+    const reply = await generateAiReply({
+      instagramAccountId,
+      userId: senderId,
+      text: messageText,
+    });
+    if (!reply) return;
+
+    await sendDirectMessage({
+      context: await createInstagramContext(account, `${job.id}:ai`),
+      instagramAccountId,
+      userId: senderId,
+      message: reply,
+    });
+
+    await prisma.operationalEvent.create({
+      data: {
+        workspaceId: account.workspaceId,
+        source: "WORKER",
+        level: "INFO",
+        message: "Respuesta con IA enviada",
+        payload: {
+          senderId,
+          messageId,
+          incoming: messageText.slice(0, 500),
+          reply: reply.slice(0, 500),
+        },
+      },
+    });
+  } catch (error) {
+    // Un fallo de la IA no relanza el job a proposito: al reintentarlo se
+    // volverian a evaluar las campanas ya procesadas. Se registra y se sigue.
+    await prisma.operationalEvent.create({
+      data: {
+        workspaceId: account.workspaceId,
+        source: "WORKER",
+        level: "ERROR",
+        message: `Respuesta con IA fallida: ${formatError(error)}`,
+        payload: { senderId, messageId },
+      },
+    });
   }
 }
 
